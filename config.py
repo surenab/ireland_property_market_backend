@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Database configuration
 # Get the project root directory (two levels up from this file)
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent
 DB_PATH = os.getenv("DB_PATH", str(PROJECT_ROOT / "properties.db"))
 
 # Database instance - will be initialized in main.py

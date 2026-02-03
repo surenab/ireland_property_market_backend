@@ -6,13 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import os
-import sys
-from pathlib import Path
 
-# Add parent directory to path to import database and models
-sys.path.insert(0, str(Path(__file__).parent.parent))
-# Add backend directory to path for config imports
-sys.path.insert(0, str(Path(__file__).parent))
 
 from database import Database
 from config import set_db_instance, get_db_path
