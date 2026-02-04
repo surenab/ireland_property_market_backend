@@ -10,11 +10,20 @@ from datetime import datetime
 
 
 from database import PropertyRepository, AddressRepository, PriceHistoryRepository
-from models import PropertyModel, AddressModel, PriceHistoryModel
+from models import (
+    PropertyModel,
+    AddressModel,
+    PriceHistoryModel,
+    generate_address_hash,
+    parse_date,
+)
 from api.schemas import (
     PropertyResponse,
     PropertyListItem,
     PriceHistoryResponse,
+    BulkUploadRequest,
+    BulkUploadResponse,
+    BulkUploadResult,
 )
 from dependencies import get_db
 
@@ -233,3 +242,204 @@ async def get_property_history(
         PriceHistoryResponse.from_orm(ph)
         for ph in sorted(price_history, key=lambda x: x.date_of_sale)
     ]
+
+
+@router.post("/bulk-upload", response_model=BulkUploadResponse)
+async def bulk_upload_properties(
+    request: BulkUploadRequest,
+    db: Session = Depends(get_db),
+):
+    """Bulk upload properties with create or update logic.
+
+    For each property:
+    - If address/eircode exists, update the property
+    - If not, create a new property
+    - Always update/add price history records
+    """
+    property_repo = PropertyRepository(db)
+    address_repo = AddressRepository(db)
+    price_history_repo = PriceHistoryRepository(db)
+
+    results = []
+    created_count = 0
+    updated_count = 0
+    failed_count = 0
+
+    for prop_data in request.properties:
+        try:
+            # Find existing address by address hash or eircode
+            address_hash = generate_address_hash(
+                prop_data.address.address,
+                prop_data.address.county,
+                prop_data.address.eircode,
+            )
+            existing_address = address_repo.find_by_hash(address_hash)
+
+            if existing_address:
+                # Update existing property
+                property_obj = property_repo.get_property_by_id(
+                    existing_address.property_id
+                )
+                if not property_obj:
+                    results.append(
+                        BulkUploadResult(
+                            success=False,
+                            message=f"Property not found for address {existing_address.id}",
+                            address=prop_data.address.address,
+                        )
+                    )
+                    failed_count += 1
+                    continue
+
+                # Update property daft data if provided
+                if prop_data.daft_url is not None:
+                    property_obj.daft_url = prop_data.daft_url
+                if prop_data.daft_html is not None:
+                    property_obj.daft_html = prop_data.daft_html
+                if prop_data.daft_title is not None:
+                    property_obj.daft_title = prop_data.daft_title
+                if prop_data.daft_body is not None:
+                    property_obj.daft_body = prop_data.daft_body
+                if prop_data.daft_scraped is not None:
+                    property_obj.daft_scraped = prop_data.daft_scraped
+                    if prop_data.daft_scraped:
+                        property_obj.daft_scraped_at = datetime.utcnow()
+
+                property_obj.updated_at = datetime.utcnow()
+                db.flush()
+
+                # Update address geo data if provided
+                if (
+                    prop_data.address.latitude is not None
+                    and prop_data.address.longitude is not None
+                ):
+                    address_repo.update_geo_data(
+                        existing_address.id,
+                        prop_data.address.latitude,
+                        prop_data.address.longitude,
+                        prop_data.address.formatted_address,
+                        prop_data.address.country,
+                    )
+
+                property_id = property_obj.id
+                updated_count += 1
+                action = "updated"
+            else:
+                # Create new property
+                property_obj = property_repo.get_or_create_property()
+
+                # Set daft data
+                if prop_data.daft_url is not None:
+                    property_obj.daft_url = prop_data.daft_url
+                if prop_data.daft_html is not None:
+                    property_obj.daft_html = prop_data.daft_html
+                if prop_data.daft_title is not None:
+                    property_obj.daft_title = prop_data.daft_title
+                if prop_data.daft_body is not None:
+                    property_obj.daft_body = prop_data.daft_body
+                property_obj.daft_scraped = prop_data.daft_scraped
+                if prop_data.daft_scraped:
+                    property_obj.daft_scraped_at = datetime.utcnow()
+
+                db.flush()
+                property_id = property_obj.id
+
+                # Create address
+                address_obj = address_repo.create_address(
+                    property_id=property_id,
+                    address=prop_data.address.address,
+                    county=prop_data.address.county,
+                    eircode=prop_data.address.eircode,
+                    address_hash=address_hash,
+                )
+
+                # Set geo data if provided
+                if (
+                    prop_data.address.latitude is not None
+                    and prop_data.address.longitude is not None
+                ):
+                    address_repo.update_geo_data(
+                        address_obj.id,
+                        prop_data.address.latitude,
+                        prop_data.address.longitude,
+                        prop_data.address.formatted_address,
+                        prop_data.address.country,
+                    )
+
+                created_count += 1
+                action = "created"
+
+            # Add/update price history
+            for price_data in prop_data.price_history:
+                # Parse date
+                sale_date = parse_date(price_data.date_of_sale)
+                if not sale_date:
+                    # Try parsing as YYYY-MM-DD format
+                    try:
+                        sale_date = datetime.strptime(
+                            price_data.date_of_sale, "%Y-%m-%d"
+                        ).date()
+                    except ValueError:
+                        continue
+
+                # Check if price history already exists for this date
+                existing_history = (
+                    db.query(PriceHistoryModel)
+                    .filter(
+                        PriceHistoryModel.property_id == property_id,
+                        PriceHistoryModel.date_of_sale == sale_date,
+                    )
+                    .first()
+                )
+
+                if existing_history:
+                    # Update existing price history
+                    existing_history.price = price_data.price
+                    existing_history.not_full_market_price = (
+                        price_data.not_full_market_price
+                    )
+                    existing_history.vat_exclusive = price_data.vat_exclusive
+                    existing_history.description = price_data.description
+                    existing_history.property_size_description = (
+                        price_data.property_size_description
+                    )
+                else:
+                    # Create new price history
+                    price_history_repo.create_price_history(
+                        property_id=property_id,
+                        date_of_sale=sale_date,
+                        price=price_data.price,
+                        not_full_market_price=price_data.not_full_market_price,
+                        vat_exclusive=price_data.vat_exclusive,
+                        description=price_data.description,
+                        property_size_description=price_data.property_size_description,
+                    )
+
+            db.commit()
+
+            results.append(
+                BulkUploadResult(
+                    success=True,
+                    property_id=property_id,
+                    message=f"Property {action} successfully",
+                    address=prop_data.address.address,
+                )
+            )
+        except Exception as e:
+            db.rollback()
+            results.append(
+                BulkUploadResult(
+                    success=False,
+                    message=f"Error: {str(e)}",
+                    address=prop_data.address.address,
+                )
+            )
+            failed_count += 1
+
+    return BulkUploadResponse(
+        total=len(request.properties),
+        created=created_count,
+        updated=updated_count,
+        failed=failed_count,
+        results=results,
+    )

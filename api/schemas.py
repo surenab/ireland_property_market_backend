@@ -278,3 +278,68 @@ class MapAnalysisResponse(BaseModel):
     heatmap_data: List[Dict[str, Any]] = []
     clusters: List[Dict[str, Any]] = []
     points: List[Dict[str, Any]] = []
+
+
+# ============================================================================
+# Bulk Upload Schemas
+# ============================================================================
+
+
+class PriceHistoryBulk(BaseModel):
+    """Price history for bulk upload."""
+
+    date_of_sale: str  # YYYY-MM-DD format
+    price: float
+    not_full_market_price: bool = False
+    vat_exclusive: bool = False
+    description: str
+    property_size_description: Optional[str] = None
+
+
+class AddressBulk(BaseModel):
+    """Address for bulk upload."""
+
+    address: str
+    county: str
+    eircode: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    formatted_address: Optional[str] = None
+    country: Optional[str] = None
+
+
+class PropertyBulk(BaseModel):
+    """Property for bulk upload."""
+
+    address: AddressBulk
+    price_history: List[PriceHistoryBulk] = []
+    daft_url: Optional[str] = None
+    daft_html: Optional[str] = None
+    daft_title: Optional[str] = None
+    daft_body: Optional[str] = None
+    daft_scraped: bool = False
+
+
+class BulkUploadRequest(BaseModel):
+    """Bulk upload request schema."""
+
+    properties: List[PropertyBulk]
+
+
+class BulkUploadResult(BaseModel):
+    """Result for a single property upload."""
+
+    success: bool
+    property_id: Optional[int] = None
+    message: str
+    address: str
+
+
+class BulkUploadResponse(BaseModel):
+    """Bulk upload response schema."""
+
+    total: int
+    created: int
+    updated: int
+    failed: int
+    results: List[BulkUploadResult]
