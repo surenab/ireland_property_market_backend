@@ -35,9 +35,13 @@ app = FastAPI(
 
 # Configure CORS
 # Get allowed origins from environment variable or use defaults
-cors_origins = os.getenv(
-    "CORS_ORIGINS", "http://localhost:3000,http://localhost:3001"
-).split(",")
+# Include Vercel frontend URL and localhost for development
+default_origins = "http://localhost:3000,http://localhost:3001,https://ireland-property-market-frontend.vercel.app"
+cors_origins_str = os.getenv("CORS_ORIGINS", default_origins)
+# Split and strip whitespace, filter out empty strings
+cors_origins = [
+    origin.strip() for origin in cors_origins_str.split(",") if origin.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
