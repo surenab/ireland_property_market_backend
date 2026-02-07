@@ -78,12 +78,14 @@ def calculate_price_trends(
             {
                 "date": str(row["period"]),
                 "average_price": (
-                    float(row["average_price"])
+                    int(round(float(row["average_price"])))
                     if pd.notna(row["average_price"])
-                    else 0.0
+                    else 0
                 ),
                 "median_price": (
-                    float(row["median_price"]) if pd.notna(row["median_price"]) else 0.0
+                    int(round(float(row["median_price"])))
+                    if pd.notna(row["median_price"])
+                    else 0
                 ),
                 "std_deviation": (
                     float(row["std_deviation"])
@@ -141,8 +143,8 @@ def calculate_price_clusters(
                             "max": float(max(cluster_prices)),
                         },
                         "count": len(cluster_prices),
-                        "average_price": float(np.mean(cluster_prices)),
-                        "center_price": float(centers[i]),
+                        "average_price": int(round(float(np.mean(cluster_prices)))),
+                        "center_price": int(round(float(centers[i]))),
                     }
                 )
 
@@ -171,7 +173,7 @@ def calculate_price_clusters(
                             "max": float(max(cluster_prices)),
                         },
                         "count": len(cluster_prices),
-                        "average_price": float(np.mean(cluster_prices)),
+                        "average_price": int(round(float(np.mean(cluster_prices)))),
                     }
                 )
 
@@ -205,7 +207,7 @@ def simple_price_clustering(prices: List[float], n_clusters: int) -> List[Dict]:
                         "max": float(max(cluster_prices)),
                     },
                     "count": len(cluster_prices),
-                    "average_price": float(np.mean(cluster_prices)),
+                    "average_price": int(round(float(np.mean(cluster_prices)))),
                 }
             )
 
@@ -243,8 +245,8 @@ def calculate_county_statistics(properties_data: List[Dict]) -> List[Dict]:
                 {
                     "county": county,
                     "property_count": data["count"],
-                    "average_price": float(np.mean(prices)),
-                    "median_price": float(np.median(prices)),
+                    "average_price": int(round(float(np.mean(prices)))),
+                    "median_price": int(round(float(np.median(prices)))),
                     "min_price": float(min(prices)),
                     "max_price": float(max(prices)),
                 }

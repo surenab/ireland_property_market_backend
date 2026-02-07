@@ -5,7 +5,7 @@ Property routes for API.
 from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import Optional, List
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import or_, func
+from sqlalchemy import or_, and_, func
 from datetime import datetime
 
 
@@ -26,11 +26,14 @@ from api.schemas import (
     BulkUploadResult,
 )
 from dependencies import get_db
+from api.cache import cached
+from api.services.property_filtering import get_latest_prices_in_date_range
 
 router = APIRouter()
 
 
 @router.get("/", response_model=dict)
+@cached(ttl=300)  # Cache for 5 minutes
 async def list_properties(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=1000),
@@ -39,15 +42,19 @@ async def list_properties(
     max_price: Optional[float] = None,
     has_geocoding: Optional[bool] = None,
     has_daft_data: Optional[bool] = None,
+    min_sales: Optional[int] = Query(None, ge=1, description="Minimum number of price history entries (e.g. 2 = at least 2 sales)"),
+    sort: Optional[str] = Query("default", description="Sort: default (id), price_asc, price_desc, date_desc"),
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     db: Session = Depends(get_db),
 ):
     """List properties with pagination and filtering."""
+    from datetime import timedelta
+
     PropertyRepository(db)
     AddressRepository(db)
-    price_history_repo = PriceHistoryRepository(db)
 
     # Build base query with join to addresses
-    # Start simple: just get properties that have addresses
     try:
         base_query = db.query(PropertyModel).join(
             AddressModel, PropertyModel.id == AddressModel.property_id
@@ -58,6 +65,34 @@ async def list_properties(
         logger = logging.getLogger(__name__)
         logger.error(f"Error building base query: {e}")
         raise
+
+    # Date range filter: properties that have at least one sale in range
+    if start_date or end_date:
+        date_filters = []
+        if start_date:
+            try:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+                date_filters.append(PriceHistoryModel.date_of_sale >= start_dt)
+            except ValueError:
+                pass
+        if end_date:
+            try:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").date() + timedelta(
+                    days=1
+                )
+                date_filters.append(PriceHistoryModel.date_of_sale < end_dt)
+            except ValueError:
+                pass
+        if date_filters:
+            props_in_range = (
+                db.query(PriceHistoryModel.property_id)
+                .filter(and_(*date_filters))
+                .distinct()
+                .subquery()
+            )
+            base_query = base_query.join(
+                props_in_range, PropertyModel.id == props_in_range.c.property_id
+            )
 
     # Apply filters
     if county:
@@ -78,6 +113,18 @@ async def list_properties(
             base_query = base_query.filter(PropertyModel.daft_html.isnot(None))
         else:
             base_query = base_query.filter(PropertyModel.daft_html.is_(None))
+
+    # Min sales: properties with at least N price history entries
+    if min_sales is not None and min_sales >= 1:
+        sales_count_subquery = (
+            db.query(PriceHistoryModel.property_id)
+            .group_by(PriceHistoryModel.property_id)
+            .having(func.count(PriceHistoryModel.id) >= min_sales)
+            .subquery()
+        )
+        base_query = base_query.join(
+            sales_count_subquery, PropertyModel.id == sales_count_subquery.c.property_id
+        )
 
     # Price filtering (requires join with price_history)
     if min_price is not None or max_price is not None:
@@ -115,44 +162,76 @@ async def list_properties(
             "total_pages": 0,
         }
 
-    # Get the property IDs for this page
     offset = (page - 1) * page_size
-    property_ids = property_ids_query.offset(offset).limit(page_size).all()
+
+    # Apply sort: join with latest price/date subquery and order
+    if sort in ("price_asc", "price_desc", "date_desc"):
+        latest_date_subq = (
+            db.query(
+                PriceHistoryModel.property_id,
+                func.max(PriceHistoryModel.date_of_sale).label("latest_date"),
+            )
+            .group_by(PriceHistoryModel.property_id)
+            .subquery()
+        )
+        sort_subquery = (
+            db.query(
+                PriceHistoryModel.property_id,
+                func.max(PriceHistoryModel.price).label("latest_price"),
+                latest_date_subq.c.latest_date,
+            )
+            .join(
+                latest_date_subq,
+                and_(
+                    PriceHistoryModel.property_id == latest_date_subq.c.property_id,
+                    PriceHistoryModel.date_of_sale == latest_date_subq.c.latest_date,
+                ),
+            )
+            .group_by(PriceHistoryModel.property_id, latest_date_subq.c.latest_date)
+            .subquery()
+        )
+        ordered_query = base_query.join(
+            sort_subquery, PropertyModel.id == sort_subquery.c.property_id
+        ).with_entities(PropertyModel.id)
+        if sort == "price_asc":
+            ordered_query = ordered_query.order_by(sort_subquery.c.latest_price.asc())
+        elif sort == "price_desc":
+            ordered_query = ordered_query.order_by(sort_subquery.c.latest_price.desc())
+        else:
+            ordered_query = ordered_query.order_by(sort_subquery.c.latest_date.desc())
+        property_ids = ordered_query.offset(offset).limit(page_size).all()
+    else:
+        property_ids = (
+            property_ids_query.order_by(PropertyModel.id)
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
+
     property_ids_list = [pid[0] for pid in property_ids]
 
-    # Now query the actual properties with addresses loaded
-    # Use order_by to maintain consistent ordering
+    # Batch-fetch latest (price, date) for all property IDs in one go (avoids N+1)
+    latest_prices_map = get_latest_prices_in_date_range(
+        db, property_ids_list, start_date, end_date
+    )
+
+    # Load properties with addresses (single query)
     properties = (
         db.query(PropertyModel)
         .filter(PropertyModel.id.in_(property_ids_list))
         .options(joinedload(PropertyModel.address))
-        .order_by(PropertyModel.id)
         .all()
     )
+    id_to_prop = {p.id: p for p in properties}
 
-    # Build response
+    # Build response in sort order using property_ids_list
     items = []
-    for prop in properties:
-        # Access address - it should be loaded via joinedload
+    for pid in property_ids_list:
+        prop = id_to_prop.get(pid)
+        if not prop:
+            continue
         address = prop.address
-
-        # Get latest price - optimize by getting it in a single query if possible
-        # For now, use the repository method
-        price_history = price_history_repo.get_price_history_by_property(prop.id)
-        latest_price = None
-        latest_sale_date = None
-        if price_history:
-            latest = max(price_history, key=lambda x: x.date_of_sale)
-            latest_price = latest.price
-            # Convert date to string for API response
-            if latest.date_of_sale:
-                if isinstance(latest.date_of_sale, datetime):
-                    latest_sale_date = latest.date_of_sale.date().strftime("%Y-%m-%d")
-                elif hasattr(latest.date_of_sale, "strftime"):
-                    latest_sale_date = latest.date_of_sale.strftime("%Y-%m-%d")
-                else:
-                    latest_sale_date = str(latest.date_of_sale)
-
+        latest_price, latest_sale_date = latest_prices_map.get(pid, (None, None))
         items.append(
             PropertyListItem(
                 id=prop.id,
@@ -175,6 +254,7 @@ async def list_properties(
 
 
 @router.get("/{property_id}", response_model=PropertyResponse)
+@cached(ttl=300)  # Cache for 5 minutes
 async def get_property(
     property_id: int,
     db: Session = Depends(get_db),
@@ -224,6 +304,7 @@ async def get_property(
 
 
 @router.get("/{property_id}/history", response_model=List[PriceHistoryResponse])
+@cached(ttl=300)  # Cache for 5 minutes
 async def get_property_history(
     property_id: int,
     db: Session = Depends(get_db),

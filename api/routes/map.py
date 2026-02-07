@@ -7,48 +7,53 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, List
 import logging
+import random
 
 
 from models import PropertyModel, AddressModel, PriceHistoryModel
 from api.schemas import (
-    MapClustersResponse,
     MapPointsResponse,
     MapPoint,
     MapAnalysisResponse,
+    HeatmapPolygon,
+    PropertyListItem,
 )
 from dependencies import get_db
+from api.cache import cached
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def create_map_point(
-    prop: PropertyModel,
-    address: AddressModel,
-    latest_price: Optional[float],
-    latest_date: Optional[str] = None,
-) -> MapPoint:
-    """Create a map point from property and address."""
-    return MapPoint(
-        id=prop.id,
-        latitude=address.latitude,
-        longitude=address.longitude,
-        price=latest_price,
-        address=address.address,
-        county=address.county,
-        date=latest_date,
-    )
+# Zoom 0-9: sample cap for map performance; zoom 10+: more points but capped for speed
+SAMPLE_POINTS_CAP = 500
+MAX_POINTS_ZOOM_10_PLUS = (
+    5000  # was 50k; lower cap avoids slow queries and huge responses
+)
+
+
+def get_max_points_for_zoom(zoom: Optional[int]) -> int:
+    """Get maximum points to return based on zoom level. No clustering."""
+    if zoom is None:
+        return SAMPLE_POINTS_CAP
+    if zoom <= 9:
+        return SAMPLE_POINTS_CAP
+    return MAX_POINTS_ZOOM_10_PLUS
 
 
 @router.get("/points", response_model=MapPointsResponse)
+@cached(ttl=300)  # Cache for 5 minutes
 async def get_map_points(
     north: float = Query(..., description="North boundary"),
     south: float = Query(..., description="South boundary"),
     east: float = Query(..., description="East boundary"),
     west: float = Query(..., description="West boundary"),
-    max_points: int = Query(1000, ge=1, description="Maximum points to return"),
+    zoom: Optional[int] = Query(None, description="Map zoom level"),
+    max_points: Optional[int] = Query(
+        None, ge=1, description="Maximum points to return (overrides zoom-based limit)"
+    ),
     county: Optional[str] = Query(None, description="Filter by county"),
     min_price: Optional[float] = Query(None, description="Minimum price filter"),
     max_price: Optional[float] = Query(None, description="Maximum price filter"),
@@ -58,16 +63,16 @@ async def get_map_points(
     has_daft_data: Optional[bool] = Query(
         None, description="Filter by Daft.ie data availability"
     ),
+    min_sales: Optional[int] = Query(
+        None, ge=1, description="Minimum number of sales (price history entries)"
+    ),
     start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     db: Session = Depends(get_db),
 ):
-    """Get individual map points for a viewport (for small areas or low zoom)."""
+    """Get individual map points for a viewport. Returns only id, lat, lng; details loaded on click via GET /api/properties/{id}."""
     from sqlalchemy import func
-    from api.services.property_filtering import (
-        build_property_query,
-        get_latest_prices_in_date_range,
-    )
+    from api.services.property_filtering import build_property_query
     from models import PriceHistoryModel
 
     # Build base query with filters using utility function (without price filters)
@@ -82,6 +87,7 @@ async def get_map_points(
         end_date=end_date,
         has_geocoding=has_geocoding,
         has_daft_data=has_daft_data,
+        min_sales=min_sales,
         min_price=None,  # We'll handle price filtering after getting latest prices
         max_price=None,
     )
@@ -148,79 +154,65 @@ async def get_map_points(
         if max_price is not None:
             query = query.filter(price_with_date_subquery.c.latest_price <= max_price)
 
-    # Get total count BEFORE limiting
-    total_count = query.count()
-
-    # Now apply limit for the actual results
-    query = query.limit(max_points)
-
-    results = query.all()
-    property_ids = [prop.id for prop, _ in results]
-
-    # Get latest prices WITHIN the date range if dates are provided
-    price_map = get_latest_prices_in_date_range(
-        db=db,
-        property_ids=property_ids,
-        start_date=start_date,
-        end_date=end_date,
+    # Never run query.count() here - it is very slow on large joined result sets.
+    effective_max_points = (
+        max_points if max_points is not None else get_max_points_for_zoom(zoom)
     )
+    if zoom is not None and zoom <= 9:
+        # Fast path: ORDER BY id LIMIT N, then random.sample in Python.
+        fetch_limit = min(effective_max_points * 3, 1000)
+        results = query.order_by(PropertyModel.id).limit(fetch_limit).all()
+        if len(results) > effective_max_points:
+            results = random.sample(results, effective_max_points)
+    else:
+        # Zoom 10+: limit only (no count); cap at MAX_POINTS_ZOOM_10_PLUS.
+        results = query.order_by(PropertyModel.id).limit(effective_max_points).all()
+    total_count = len(results)
 
-    points = []
-    for prop, address in results:
-        # Get latest price and date from price_map (within date range if dates provided)
-        price_data = price_map.get(prop.id)
-        latest_price = price_data[0] if price_data else None
-        latest_date = None
-        if price_data and len(price_data) > 1:
-            latest_date_value = price_data[1]
-            # Convert date to string in YYYY-MM-DD format
-            if latest_date_value:
-                if isinstance(latest_date_value, datetime):
-                    latest_date = latest_date_value.date().strftime("%Y-%m-%d")
-                elif hasattr(latest_date_value, "strftime"):
-                    # date object
-                    latest_date = latest_date_value.strftime("%Y-%m-%d")
-                elif isinstance(latest_date_value, str):
-                    latest_date = latest_date_value
-
-        points.append(create_map_point(prop, address, latest_price, latest_date))
+    # Return only id, latitude, longitude for map markers; details loaded on click via GET /api/properties/{id}
+    points = [
+        MapPoint(
+            id=prop.id,
+            latitude=address.latitude,
+            longitude=address.longitude,
+            price=None,
+            address=None,
+            county=None,
+            date=None,
+        )
+        for prop, address in results
+    ]
 
     return MapPointsResponse(points=points, total=total_count)
 
 
-@router.get("/clusters", response_model=MapClustersResponse)
-async def get_map_clusters(
+@router.get("/list")
+@cached(ttl=300)
+async def get_map_list(
     north: float = Query(..., description="North boundary"),
     south: float = Query(..., description="South boundary"),
     east: float = Query(..., description="East boundary"),
     west: float = Query(..., description="West boundary"),
-    zoom: int = Query(10, ge=1, le=20, description="Zoom level"),
-    cluster_mode: str = Query(
-        "geographic", description="Clustering mode: geographic, price, size"
-    ),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
     county: Optional[str] = Query(None, description="Filter by county"),
-    min_price: Optional[float] = Query(None, description="Minimum price filter"),
-    max_price: Optional[float] = Query(None, description="Maximum price filter"),
-    has_geocoding: Optional[bool] = Query(
-        None, description="Filter by geocoding status"
+    min_price: Optional[float] = Query(None),
+    max_price: Optional[float] = Query(None),
+    has_geocoding: Optional[bool] = Query(None),
+    has_daft_data: Optional[bool] = Query(None),
+    min_sales: Optional[int] = Query(
+        None, ge=1, description="Minimum number of sales (price history entries)"
     ),
-    has_daft_data: Optional[bool] = Query(
-        None, description="Filter by Daft.ie data availability"
-    ),
-    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
-    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Get map clusters for a viewport with different clustering modes."""
-    from api.services.map_clustering import cluster_properties
+    """Paginated list of properties in viewport (for Map page sidebar). Same filters as map points."""
     from api.services.property_filtering import (
         build_property_query,
         get_latest_prices_in_date_range,
     )
-    from sqlalchemy import func
-    from models import PriceHistoryModel
 
-    # Build base query with filters using utility function
     query = build_property_query(
         db=db,
         north=north,
@@ -232,68 +224,126 @@ async def get_map_clusters(
         end_date=end_date,
         has_geocoding=has_geocoding,
         has_daft_data=has_daft_data,
+        min_sales=min_sales,
+        min_price=None,
+        max_price=None,
     )
 
-    # Price filtering (requires join with price_history)
     if min_price is not None or max_price is not None:
-        # Get latest price for each property
-        price_subquery = (
+        price_date_filter = []
+        if start_date:
+            try:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+                price_date_filter.append(PriceHistoryModel.date_of_sale >= start_dt)
+            except ValueError:
+                pass
+        if end_date:
+            try:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").date() + timedelta(
+                    days=1
+                )
+                price_date_filter.append(PriceHistoryModel.date_of_sale < end_dt)
+            except ValueError:
+                pass
+        latest_price_subquery = db.query(
+            PriceHistoryModel.property_id,
+            func.max(PriceHistoryModel.date_of_sale).label("latest_date"),
+        )
+        if price_date_filter:
+            latest_price_subquery = latest_price_subquery.filter(
+                and_(*price_date_filter)
+            )
+        latest_price_subquery = latest_price_subquery.group_by(
+            PriceHistoryModel.property_id
+        ).subquery()
+        price_with_date_subquery = (
             db.query(
                 PriceHistoryModel.property_id,
-                func.max(PriceHistoryModel.price).label("latest_price"),
+                PriceHistoryModel.price.label("latest_price"),
             )
-            .group_by(PriceHistoryModel.property_id)
+            .join(
+                latest_price_subquery,
+                and_(
+                    PriceHistoryModel.property_id
+                    == latest_price_subquery.c.property_id,
+                    PriceHistoryModel.date_of_sale
+                    == latest_price_subquery.c.latest_date,
+                ),
+            )
             .subquery()
         )
         query = query.join(
-            price_subquery, PropertyModel.id == price_subquery.c.property_id
+            price_with_date_subquery,
+            PropertyModel.id == price_with_date_subquery.c.property_id,
         )
-
         if min_price is not None:
-            query = query.filter(price_subquery.c.latest_price >= min_price)
+            query = query.filter(price_with_date_subquery.c.latest_price >= min_price)
         if max_price is not None:
-            query = query.filter(price_subquery.c.latest_price <= max_price)
+            query = query.filter(price_with_date_subquery.c.latest_price <= max_price)
 
-    results = query.all()
-    property_ids = [prop.id for prop, _ in results]
+    property_ids_query = (
+        query.with_entities(PropertyModel.id).distinct().order_by(PropertyModel.id)
+    )
+    total = property_ids_query.count()
+    if total == 0:
+        return {
+            "items": [],
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+        }
+    offset = (page - 1) * page_size
+    property_ids = [
+        row[0] for row in property_ids_query.offset(offset).limit(page_size).all()
+    ]
 
-    # Get latest prices WITHIN the date range if dates are provided
+    results = (
+        db.query(PropertyModel, AddressModel)
+        .join(AddressModel, PropertyModel.id == AddressModel.property_id)
+        .filter(PropertyModel.id.in_(property_ids))
+        .order_by(PropertyModel.id)
+        .all()
+    )
     price_map = get_latest_prices_in_date_range(
         db=db,
         property_ids=property_ids,
         start_date=start_date,
         end_date=end_date,
     )
-
-    # Prepare data for clustering
-    properties_data = []
+    items = []
     for prop, address in results:
-        # Get latest price from price_map (within date range if dates provided)
         price_data = price_map.get(prop.id)
         latest_price = price_data[0] if price_data else None
-
-        properties_data.append(
-            {
-                "id": prop.id,
-                "latitude": address.latitude,
-                "longitude": address.longitude,
-                "price": latest_price,
-                "address": address.address,
-                "county": address.county,
-            }
+        latest_sale_date = None
+        if price_data and len(price_data) > 1 and price_data[1]:
+            d = price_data[1]
+            latest_sale_date = (
+                d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
+            )
+        items.append(
+            PropertyListItem(
+                id=prop.id,
+                address=address.address if address else None,
+                county=address.county if address else None,
+                latitude=address.latitude if address else None,
+                longitude=address.longitude if address else None,
+                latest_price=latest_price,
+                latest_sale_date=latest_sale_date,
+            )
         )
-
-    # Cluster properties
-    clusters = cluster_properties(properties_data, zoom, cluster_mode)
-
-    return MapClustersResponse(
-        clusters=clusters,
-        total_properties=len(properties_data),
-        viewport={"north": north, "south": south, "east": east, "west": west},
-    )
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
 
 
 @router.get("/analysis", response_model=MapAnalysisResponse)
+@cached(ttl=300)  # Cache for 5 minutes
 async def get_map_analysis(
     north: float = Query(..., description="North boundary"),
     south: float = Query(..., description="South boundary"),
@@ -303,6 +353,7 @@ async def get_map_analysis(
         ...,
         description="Analysis mode: spatial-patterns, hotspots, cluster-identification, growth-decline, price-heatmap, sales-heatmap",
     ),
+    zoom: Optional[int] = Query(None, description="Map zoom level"),
     county: Optional[str] = Query(None, description="Filter by county"),
     start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
@@ -342,22 +393,29 @@ async def get_map_analysis(
         has_daft_data=has_daft_data,
     )
 
-    # Limit results to prevent timeout (max 10000 properties)
-    # First, get count to check if we need to limit
+    # Get total count
     count = query.count()
-    logger.info(f"Found {count} properties in viewport")
+    logger.info(f"Found {count} properties in viewport at zoom {zoom}")
 
-    if count > 10000:
-        logger.warning(f"Too many properties ({count}), limiting to 10000")
-        results = query.limit(10000).all()
-    else:
-        results = query.all()
+    # Apply zoom-based limit for performance
+    # For zoom 0-7, we'll cluster all properties, but still limit raw results for processing
+    max_results = (
+        get_max_points_for_zoom(zoom) * 2
+        if zoom and zoom <= 7
+        else get_max_points_for_zoom(zoom)
+    )
+    if count > max_results:
+        logger.info(f"Limiting results from {count} to {max_results} for zoom {zoom}")
+        query = query.limit(max_results)
+
+    results = query.all()
 
     # Get all property IDs
     property_ids = [prop.id for prop, _ in results]
 
-    # Optimize: Get latest price for all properties in a single query
+    # Optimize: Get latest price for all properties
     # If date filters are applied, get the latest price WITHIN the date range
+    # Batch queries to avoid SQL parameter limits (typically 1000-2000)
     if property_ids:
         # Build date filter for price history if dates are provided
         # Note: date_of_sale is stored as String, so we compare as strings
@@ -377,40 +435,50 @@ async def get_map_analysis(
             except ValueError:
                 pass
 
-        # Query for latest prices
-        latest_prices_query = db.query(
-            PriceHistoryModel.property_id,
-            func.max(PriceHistoryModel.date_of_sale).label("latest_date"),
-        ).filter(PriceHistoryModel.property_id.in_(property_ids))
+        # Batch queries to avoid SQL parameter limits
+        BATCH_SIZE = 10000
+        price_map = {}
 
-        # Apply date filter if provided - get latest price WITHIN the date range
-        if price_date_filter:
-            latest_prices_query = latest_prices_query.filter(and_(*price_date_filter))
+        for i in range(0, len(property_ids), BATCH_SIZE):
+            batch_ids = property_ids[i : i + BATCH_SIZE]
 
-        latest_prices_subquery = latest_prices_query.group_by(
-            PriceHistoryModel.property_id
-        ).subquery()
-
-        latest_prices = (
-            db.query(
+            # Query for latest prices for this batch
+            latest_prices_query = db.query(
                 PriceHistoryModel.property_id,
-                PriceHistoryModel.price,
-                PriceHistoryModel.date_of_sale,
-            )
-            .join(
-                latest_prices_subquery,
-                and_(
-                    PriceHistoryModel.property_id
-                    == latest_prices_subquery.c.property_id,
-                    PriceHistoryModel.date_of_sale
-                    == latest_prices_subquery.c.latest_date,
-                ),
-            )
-            .all()
-        )
+                func.max(PriceHistoryModel.date_of_sale).label("latest_date"),
+            ).filter(PriceHistoryModel.property_id.in_(batch_ids))
 
-        # Create a dict for fast lookup
-        price_map = {pid: (price, date) for pid, price, date in latest_prices}
+            # Apply date filter if provided - get latest price WITHIN the date range
+            if price_date_filter:
+                latest_prices_query = latest_prices_query.filter(
+                    and_(*price_date_filter)
+                )
+
+            latest_prices_subquery = latest_prices_query.group_by(
+                PriceHistoryModel.property_id
+            ).subquery()
+
+            latest_prices = (
+                db.query(
+                    PriceHistoryModel.property_id,
+                    PriceHistoryModel.price,
+                    PriceHistoryModel.date_of_sale,
+                )
+                .join(
+                    latest_prices_subquery,
+                    and_(
+                        PriceHistoryModel.property_id
+                        == latest_prices_subquery.c.property_id,
+                        PriceHistoryModel.date_of_sale
+                        == latest_prices_subquery.c.latest_date,
+                    ),
+                )
+                .all()
+            )
+
+            # Add results to dict
+            for pid, price, date in latest_prices:
+                price_map[pid] = (price, date)
     else:
         price_map = {}
 
@@ -442,7 +510,55 @@ async def get_map_analysis(
             }
         )
     logger.info(f"Processed {len(properties_data)} properties")
-    # Process based on analysis mode
+
+    # For zoom 0-7, use clustering with real counts
+    if zoom is not None and zoom <= 7:
+        from api.services.map_clustering import (
+            cluster_properties_by_grid_with_real_counts,
+        )
+
+        clusters = cluster_properties_by_grid_with_real_counts(properties_data, zoom)
+
+        # Convert clusters to heatmap data
+        heatmap_data = []
+        max_count = max([c["count"] for c in clusters]) if clusters else 1
+        for cluster in clusters:
+            intensity = min(cluster["count"] / max_count, 1.0) if max_count > 0 else 0
+            heatmap_data.append(
+                {
+                    "lat": cluster["center_lat"],
+                    "lng": cluster["center_lng"],
+                    "intensity": intensity,
+                    "data": {
+                        "intensity": intensity,
+                        "sales_count": cluster["count"],  # Real count
+                        "avg_price": cluster.get("avg_price"),
+                        "min_price": cluster.get("min_price"),
+                        "max_price": cluster.get("max_price"),
+                    },
+                }
+            )
+
+        from api.services.heatmap import compute_heatmap_polygons
+
+        heatmap_polygons_raw = compute_heatmap_polygons(
+            properties_data, north, south, east, west, analysis_mode
+        )
+        heatmap_polygons = [HeatmapPolygon(**p) for p in heatmap_polygons_raw]
+
+        response_data: Dict[str, Any] = {
+            "analysis_mode": analysis_mode,
+            "total_properties": len(properties_data),  # Total before clustering
+            "viewport": {"north": north, "south": south, "east": east, "west": west},
+            "heatmap_data": heatmap_data,
+            "heatmap_polygons": heatmap_polygons,
+            "clusters": clusters,  # Include cluster data with real counts
+            "points": [],
+        }
+
+        return MapAnalysisResponse(**response_data)
+
+    # Process based on analysis mode for zoom 8+
     response_data: Dict[str, Any] = {
         "analysis_mode": analysis_mode,
         "total_properties": len(properties_data),
@@ -524,7 +640,7 @@ async def get_map_analysis(
             ]
 
             prices = [p.price for p in cluster.properties if p.price]
-            avg_price = sum(prices) / len(prices) if prices else 0
+            avg_price = int(round(sum(prices) / len(prices))) if prices else 0
 
             cluster_data = {
                 "center_lat": cluster.center_lat,
@@ -539,7 +655,7 @@ async def get_map_analysis(
         heatmap_data = []
         for cluster in clusters:
             prices = [p.price for p in cluster.properties if p.price]
-            avg_price = sum(prices) / len(prices) if prices else 0
+            avg_price = int(round(sum(prices) / len(prices))) if prices else 0
             heatmap_data.append(
                 {
                     "lat": cluster.center_lat,
@@ -644,8 +760,8 @@ async def get_map_analysis(
                                         "data": {
                                             "intensity": normalized_intensity,
                                             "change_percent": round(change_percent, 2),
-                                            "early_avg": round(early_avg, 2),
-                                            "late_avg": round(late_avg, 2),
+                                            "early_avg": int(round(early_avg)),
+                                            "late_avg": int(round(late_avg)),
                                         },
                                     }
                                 )
@@ -695,7 +811,7 @@ async def get_map_analysis(
                             "intensity": intensity_val,
                             "data": {
                                 "intensity": intensity_val,
-                                "avg_price": avg_price,
+                                "avg_price": int(round(avg_price)),
                             },
                         }
                     )
@@ -738,8 +854,18 @@ async def get_map_analysis(
             for c in clusters
         ]
 
+    # Heatmap polygons (grid cells with metadata)
+    from api.services.heatmap import compute_heatmap_polygons
+
+    heatmap_polygons_raw = compute_heatmap_polygons(
+        properties_data, north, south, east, west, analysis_mode
+    )
+    response_data["heatmap_polygons"] = [
+        HeatmapPolygon(**p) for p in heatmap_polygons_raw
+    ]
+
     # Also return points for marker display
-    response_data["points"] = properties_data[:1000]  # Limit points
+    response_data["points"] = properties_data[:]  # Limit points
 
     # Ensure viewport is a MapViewport dict
     response_data["viewport"] = {

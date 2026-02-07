@@ -211,6 +211,29 @@ class CountyComparisonResponse(BaseModel):
     overall_median: float
 
 
+class DatabaseStatsResponse(BaseModel):
+    """Database statistics response."""
+
+    total_addresses: int
+    total_properties: int
+    total_price_history: int
+
+
+class PriceDistributionBucket(BaseModel):
+    """Single bucket in price distribution histogram."""
+
+    bucket_label: str  # e.g. "€0–100k", "€100k–200k"
+    min_price: float
+    max_price: float
+    count: int
+
+
+class PriceDistributionResponse(BaseModel):
+    """Price distribution (histogram) response."""
+
+    buckets: List[PriceDistributionBucket]
+
+
 class CorrelationResponse(BaseModel):
     """Correlation analysis response."""
 
@@ -269,6 +292,13 @@ class MapViewport(BaseModel):
     zoom: Optional[int] = None
 
 
+class HeatmapPolygon(BaseModel):
+    """Single heatmap polygon (GeoJSON-style ring(s) + metadata)."""
+
+    coordinates: List[List[List[float]]]  # list of rings, each ring list of [lng, lat]
+    metadata: Dict[str, Any] = {}
+
+
 class MapAnalysisResponse(BaseModel):
     """Map analysis response."""
 
@@ -276,6 +306,7 @@ class MapAnalysisResponse(BaseModel):
     total_properties: int
     viewport: MapViewport
     heatmap_data: List[Dict[str, Any]] = []
+    heatmap_polygons: List[HeatmapPolygon] = []
     clusters: List[Dict[str, Any]] = []
     points: List[Dict[str, Any]] = []
 

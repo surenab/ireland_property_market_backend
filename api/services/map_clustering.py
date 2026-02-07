@@ -166,3 +166,91 @@ def size_clustering(properties: List[Dict], zoom: int) -> List[MapCluster]:
     # For now, fall back to geographic clustering
     # This can be enhanced when size data is available
     return geographic_clustering(properties, zoom)
+
+
+def get_grid_size_for_zoom(zoom: int) -> float:
+    """Get grid cell size in degrees based on zoom level."""
+    if zoom <= 4:
+        return 0.1  # ~11km cells
+    elif zoom <= 7:
+        return 0.05  # ~5.5km cells
+    elif zoom <= 10:
+        return 0.01  # ~1km cells
+    else:
+        return 0.005  # ~500m cells
+
+
+def cluster_properties_by_grid_with_real_counts(
+    properties: List[Dict], zoom: int
+) -> List[Dict]:
+    """
+    Cluster properties into grid cells with REAL counts for Zoom 0-7.
+    Aggregates ALL properties in viewport (no sampling) and calculates real statistics.
+
+    Args:
+        properties: List of property dictionaries with lat/lng/price
+        zoom: Map zoom level
+
+    Returns:
+        List of cluster dictionaries with real counts and statistics
+    """
+    if not properties:
+        return []
+
+    grid_size = get_grid_size_for_zoom(zoom)
+    grid_dict: Dict[str, List[Dict]] = {}
+
+    # Group ALL properties into grid cells (no sampling)
+    for prop in properties:
+        if prop.get("latitude") is None or prop.get("longitude") is None:
+            continue
+
+        grid_lat = int(prop["latitude"] / grid_size)
+        grid_lng = int(prop["longitude"] / grid_size)
+        key = f"{grid_lat}_{grid_lng}"
+
+        if key not in grid_dict:
+            grid_dict[key] = []
+        grid_dict[key].append(prop)
+
+    # Create clusters with real counts and statistics
+    clusters = []
+    for props in grid_dict.values():
+        if not props:
+            continue
+
+        # Calculate center from all properties
+        lats = [p["latitude"] for p in props if p.get("latitude") is not None]
+        lngs = [p["longitude"] for p in props if p.get("longitude") is not None]
+
+        if not lats or not lngs:
+            continue
+
+        center_lat = sum(lats) / len(lats)
+        center_lng = sum(lngs) / len(lngs)
+
+        # Calculate REAL statistics from ALL properties (no sampling)
+        prices = [p.get("price") for p in props if p.get("price") is not None]
+
+        cluster_data = {
+            "center_lat": center_lat,
+            "center_lng": center_lng,
+            "count": len(props),  # REAL count - actual number of properties
+            "property_ids": [p["id"] for p in props],  # All property IDs in cluster
+            "avg_price": (
+                int(round(sum(prices) / len(prices))) if prices else None
+            ),  # Real average
+            "min_price": int(round(min(prices))) if prices else None,  # Real min
+            "max_price": int(round(max(prices))) if prices else None,  # Real max
+            "total_sales": len(props),  # Real sales count
+            "bounds": {
+                "north": max(lats),
+                "south": min(lats),
+                "east": max(lngs),
+                "west": min(lngs),
+            },
+        }
+
+        clusters.append(cluster_data)
+
+    return clusters

@@ -11,19 +11,21 @@ from models import PropertyModel, AddressModel, PriceHistoryModel
 from api.schemas import (
     PriceTrendsResponse,
     PriceTrendPoint,
-    ClustersResponse,
-    PriceCluster,
     CountyComparisonResponse,
     CountyStatistics,
-    CorrelationResponse,
+    DatabaseStatsResponse,
+    PriceDistributionResponse,
+    PriceDistributionBucket,
 )
 from api.services import statistics
 from dependencies import get_db
+from api.cache import cached
 
 router = APIRouter()
 
 
 @router.get("/price-trends", response_model=PriceTrendsResponse)
+@cached(ttl=300)  # Cache for 5 minutes
 async def get_price_trends(
     period: str = Query("monthly", pattern="^(monthly|quarterly|yearly)$"),
     county: Optional[str] = None,
@@ -121,72 +123,133 @@ async def get_price_trends(
     )
 
 
-@router.get("/clusters", response_model=ClustersResponse)
-async def get_price_clusters(
-    n_clusters: int = Query(5, ge=2, le=20),
-    algorithm: str = Query("kmeans", pattern="^(kmeans|dbscan)$"),
+@router.get("/price-distribution", response_model=PriceDistributionResponse)
+@cached(ttl=300)  # Cache for 5 minutes
+async def get_price_distribution(
     county: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    has_geocoding: Optional[bool] = None,
+    has_daft_data: Optional[bool] = None,
     db: Session = Depends(get_db),
 ):
-    """Get price clustering analysis."""
+    """Get price distribution (histogram buckets) with optional filters."""
+    from sqlalchemy import or_
+    from datetime import datetime, timedelta
 
-    # Build query
-    query = db.query(PriceHistoryModel)
-
+    query = (
+        db.query(PriceHistoryModel.price)
+        .join(PropertyModel, PriceHistoryModel.property_id == PropertyModel.id)
+        .join(AddressModel, PropertyModel.id == AddressModel.property_id)
+    )
     if county:
-        query = (
-            query.join(PropertyModel)
-            .join(AddressModel)
-            .filter(AddressModel.county == county)
+        query = query.filter(AddressModel.county == county)
+    if has_geocoding is not None:
+        if has_geocoding:
+            query = query.filter(
+                AddressModel.latitude.isnot(None), AddressModel.longitude.isnot(None)
+            )
+        else:
+            query = query.filter(
+                or_(AddressModel.latitude.is_(None), AddressModel.longitude.is_(None))
+            )
+    if has_daft_data is not None:
+        if has_daft_data:
+            query = query.filter(PropertyModel.daft_html.isnot(None))
+        else:
+            query = query.filter(PropertyModel.daft_html.is_(None))
+    if start_date:
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+            query = query.filter(PriceHistoryModel.date_of_sale >= start_dt)
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").date() + timedelta(days=1)
+            query = query.filter(PriceHistoryModel.date_of_sale < end_dt)
+        except ValueError:
+            pass
+    if min_price is not None:
+        query = query.filter(PriceHistoryModel.price >= min_price)
+    if max_price is not None:
+        query = query.filter(PriceHistoryModel.price <= max_price)
+
+    rows = query.all()
+    prices = [r[0] for r in rows if r[0] is not None]
+
+    # Buckets: 0-50k, 50k-100k, 100k-150k, 150k-200k, 200k-250k, 250k-300k, 300k-400k, 400k-500k, 500k-750k, 750k-1M, 1M+
+    edges = [
+        (0, 50_000, "€0–50k"),
+        (50_000, 100_000, "€50k–100k"),
+        (100_000, 150_000, "€100k–150k"),
+        (150_000, 200_000, "€150k–200k"),
+        (200_000, 250_000, "€200k–250k"),
+        (250_000, 300_000, "€250k–300k"),
+        (300_000, 400_000, "€300k–400k"),
+        (400_000, 500_000, "€400k–500k"),
+        (500_000, 750_000, "€500k–750k"),
+        (750_000, 1_000_000, "€750k–1M"),
+        (1_000_000, float("inf"), "€1M+"),
+    ]
+    buckets = []
+    for lo, hi, label in edges:
+        count = sum(1 for p in prices if lo <= p < hi)
+        buckets.append(
+            PriceDistributionBucket(
+                bucket_label=label,
+                min_price=float(lo) if hi != float("inf") else lo,
+                max_price=float(hi) if hi != float("inf") else 2_000_000,
+                count=count,
+            )
         )
-
-    price_history_records = query.all()
-
-    # Get latest price for each property
-    property_prices = {}
-    for ph in price_history_records:
-        prop_id = ph.property_id
-        if prop_id not in property_prices:
-            property_prices[prop_id] = []
-        property_prices[prop_id].append((ph.date_of_sale, ph.price))
-
-    # Get latest price per property
-    prices = []
-    for prop_id, price_list in property_prices.items():
-        latest = max(price_list, key=lambda x: x[0])
-        prices.append(latest[1])
-
-    # Calculate clusters
-    clusters_data = statistics.calculate_price_clusters(
-        prices, n_clusters=n_clusters, algorithm=algorithm
-    )
-
-    return ClustersResponse(
-        clusters=[PriceCluster(**cluster) for cluster in clusters_data],
-        algorithm=algorithm,
-        n_clusters=len(clusters_data),
-    )
+    return PriceDistributionResponse(buckets=buckets)
 
 
 @router.get("/county", response_model=CountyComparisonResponse)
+@cached(ttl=300)  # Cache for 5 minutes
 async def get_county_comparison(
+    county: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    has_geocoding: Optional[bool] = None,
+    has_daft_data: Optional[bool] = None,
     db: Session = Depends(get_db),
 ):
-    """Get county-level price comparison statistics."""
-    # Use a single optimized query with subqueries to avoid IN clause limits
-    # Get latest price per property using joins instead of IN clauses
+    """Get county-level price comparison statistics with optional filters."""
+    from sqlalchemy import or_
+    from datetime import datetime, timedelta
 
-    # Subquery to get properties with addresses that have counties
+    # Subquery: properties with addresses that have counties (and optional filters)
     properties_with_addresses = (
         db.query(PropertyModel.id)
         .join(AddressModel, PropertyModel.id == AddressModel.property_id)
         .filter(AddressModel.county.isnot(None))
-        .subquery()
     )
+    if county:
+        properties_with_addresses = properties_with_addresses.filter(AddressModel.county == county)
+    if has_geocoding is not None:
+        if has_geocoding:
+            properties_with_addresses = properties_with_addresses.filter(
+                AddressModel.latitude.isnot(None), AddressModel.longitude.isnot(None)
+            )
+        else:
+            properties_with_addresses = properties_with_addresses.filter(
+                or_(AddressModel.latitude.is_(None), AddressModel.longitude.is_(None))
+            )
+    if has_daft_data is not None:
+        if has_daft_data:
+            properties_with_addresses = properties_with_addresses.filter(PropertyModel.daft_html.isnot(None))
+        else:
+            properties_with_addresses = properties_with_addresses.filter(PropertyModel.daft_html.is_(None))
+    properties_with_addresses = properties_with_addresses.subquery()
 
-    # Get latest date per property (for properties that have addresses)
-    # Use join instead of IN to avoid SQLite parameter limits
-    latest_dates = (
+    # Get latest date per property (optionally within date range)
+    latest_dates_q = (
         db.query(
             PriceHistoryModel.property_id,
             func.max(PriceHistoryModel.date_of_sale).label("latest_date"),
@@ -195,9 +258,20 @@ async def get_county_comparison(
             properties_with_addresses,
             PriceHistoryModel.property_id == properties_with_addresses.c.id,
         )
-        .group_by(PriceHistoryModel.property_id)
-        .subquery()
     )
+    if start_date:
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+            latest_dates_q = latest_dates_q.filter(PriceHistoryModel.date_of_sale >= start_dt)
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").date() + timedelta(days=1)
+            latest_dates_q = latest_dates_q.filter(PriceHistoryModel.date_of_sale < end_dt)
+        except ValueError:
+            pass
+    latest_dates = latest_dates_q.group_by(PriceHistoryModel.property_id).subquery()
 
     # Get latest prices by joining with latest dates
     latest_prices = (
@@ -222,10 +296,14 @@ async def get_county_comparison(
         .all()
     )
 
-    # Build properties data list
+    # Build properties data list (apply price filters)
     properties_list = []
     for county, price in results:
         if county and price is not None:
+            if min_price is not None and price < min_price:
+                continue
+            if max_price is not None and price > max_price:
+                continue
             properties_list.append(
                 {
                     "county": county,
@@ -238,9 +316,9 @@ async def get_county_comparison(
 
     # Calculate overall statistics
     all_prices = [p["price"] for p in properties_list]
-    overall_average = float(sum(all_prices) / len(all_prices)) if all_prices else 0.0
+    overall_average = int(round(sum(all_prices) / len(all_prices))) if all_prices else 0
     overall_median = (
-        float(sorted(all_prices)[len(all_prices) // 2]) if all_prices else 0.0
+        int(round(sorted(all_prices)[len(all_prices) // 2])) if all_prices else 0
     )
 
     return CountyComparisonResponse(
@@ -250,110 +328,25 @@ async def get_county_comparison(
     )
 
 
-@router.get("/correlation", response_model=CorrelationResponse)
-async def get_correlation(
-    variable: str = Query("size", pattern="^(size|date)$"),
+@router.get("/db-stats", response_model=DatabaseStatsResponse)
+@cached(ttl=60)  # Cache for 1 minute (stats don't change frequently)
+async def get_database_stats(
     db: Session = Depends(get_db),
 ):
-    """Get correlation analysis between price and another variable."""
-    # Get all price history
-    price_history = db.query(PriceHistoryModel).all()
-
-    prices = []
-    x_values = []
-
-    for ph in price_history:
-        prices.append(ph.price)
-
-        if variable == "size":
-            # Extract size from property_size_description
-            size_desc = ph.property_size_description or ""
-            # Try to extract numeric size (simplified)
-            size_value = None
-            if "38" in size_desc and "125" in size_desc:
-                size_value = 81.5  # Midpoint
-            elif "less than 38" in size_desc.lower():
-                size_value = 19.0  # Midpoint of < 38
-            elif "greater than 125" in size_desc.lower() or "125" in size_desc:
-                size_value = 150.0  # Estimate
-            else:
-                size_value = None
-
-            x_values.append(size_value if size_value else float("nan"))
-
-        elif variable == "date":
-            # Use date as numeric (days since epoch)
-            from datetime import datetime
-
-            # Handle date object or string
-            if isinstance(ph.date_of_sale, datetime):
-                date_obj = ph.date_of_sale
-            elif hasattr(ph.date_of_sale, "strftime"):
-                # date object
-                date_obj = datetime.combine(ph.date_of_sale, datetime.min.time())
-            else:
-                # Try to parse string
-                date_obj = datetime.strptime(str(ph.date_of_sale), "%d/%m/%Y")
-
-            x_values.append(date_obj.timestamp())
-
-    # Calculate correlation
-    correlation_data = statistics.calculate_correlation(x_values, prices)
-
-    return CorrelationResponse(**correlation_data)
-
-
-@router.get("/date-range")
-async def get_date_range(
-    db: Session = Depends(get_db),
-):
-    """Get the minimum and maximum dates from price history."""
+    """Get database statistics: total addresses, properties, and price history records."""
     from sqlalchemy import func
 
-    # Get min and max dates from price history
-    result = (
-        db.query(
-            func.min(PriceHistoryModel.date_of_sale).label("min_date"),
-            func.max(PriceHistoryModel.date_of_sale).label("max_date"),
-        )
-        .filter(PriceHistoryModel.date_of_sale.isnot(None))
-        .first()
+    # Count total addresses
+    total_addresses = db.query(func.count(AddressModel.id)).scalar() or 0
+
+    # Count total properties
+    total_properties = db.query(func.count(PropertyModel.id)).scalar() or 0
+
+    # Count total price history records
+    total_price_history = db.query(func.count(PriceHistoryModel.id)).scalar() or 0
+
+    return DatabaseStatsResponse(
+        total_addresses=total_addresses,
+        total_properties=total_properties,
+        total_price_history=total_price_history,
     )
-
-    if result and result.min_date and result.max_date:
-        min_year = (
-            result.min_date.year
-            if hasattr(result.min_date, "year")
-            else int(str(result.min_date)[:4])
-        )
-        max_year = (
-            result.max_date.year
-            if hasattr(result.max_date, "year")
-            else int(str(result.max_date)[:4])
-        )
-
-        return {
-            "min_year": min_year,
-            "max_year": max_year,
-            "min_date": (
-                result.min_date.strftime("%Y-%m-%d")
-                if hasattr(result.min_date, "strftime")
-                else str(result.min_date)
-            ),
-            "max_date": (
-                result.max_date.strftime("%Y-%m-%d")
-                if hasattr(result.max_date, "strftime")
-                else str(result.max_date)
-            ),
-        }
-
-    # Fallback to current year if no data
-    from datetime import datetime
-
-    current_year = datetime.now().year
-    return {
-        "min_year": current_year - 1,
-        "max_year": current_year,
-        "min_date": f"{current_year - 1}-01-01",
-        "max_date": f"{current_year}-12-31",
-    }

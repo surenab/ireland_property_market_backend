@@ -1,5 +1,5 @@
 """
-Database setup and CRUD operations for SQLite.
+Database setup and CRUD operations for SQLite and PostgreSQL.
 """
 
 import logging
@@ -11,34 +11,72 @@ from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import SQLAlchemyError
 
 from models import Base, PropertyModel, AddressModel, PriceHistoryModel
+from config import get_db_path
+from config import is_production, get_database_url
 
 logger = logging.getLogger(__name__)
 
 
 class Database:
-    """Database manager for SQLite operations."""
+    """Database manager for SQLite and PostgreSQL operations."""
 
-    def __init__(self, db_path: str = "properties.db"):
-        """Initialize database connection."""
-        self.db_path = db_path
-        self.engine = create_engine(
-            f"sqlite:///{db_path}",
-            echo=False,
-            connect_args={
-                "check_same_thread": False,
-                "timeout": 30.0,  # Increase timeout for concurrent access
-            },
-            pool_pre_ping=True,  # Verify connections before using
-        )
+    def __init__(
+        self, db_path: Optional[str] = None, database_url: Optional[str] = None
+    ):
+        """Initialize database connection.
+
+        Args:
+            db_path: Path to SQLite database (used in development mode)
+            database_url: PostgreSQL connection URL (used in production mode)
+        """
+
+        # Check environment variable to determine which database to use
+        if is_production():
+            # Production mode: use PostgreSQL
+            db_url = database_url or get_database_url()
+            if not db_url:
+                raise ValueError(
+                    "Production mode requires PostgreSQL configuration. "
+                    "Please set DB_HOST, DB_USER, DB_PASSWORD, and DB_NAME environment variables."
+                )
+            logger.info("Connecting to PostgreSQL database (production mode)")
+            self.db_type = "postgresql"
+            self.db_path = None
+            self.engine = create_engine(
+                db_url,
+                echo=False,
+                pool_pre_ping=True,  # Verify connections before using
+                pool_size=5,  # Connection pool size
+                max_overflow=10,  # Max overflow connections
+            )
+        else:
+            # Development mode: use SQLite
+            self.db_path = db_path or get_db_path()
+            self.db_type = "sqlite"
+            logger.info(
+                f"Connecting to SQLite database at {self.db_path} (development mode)"
+            )
+            self.engine = create_engine(
+                f"sqlite:///{self.db_path}",
+                echo=False,
+                connect_args={
+                    "check_same_thread": False,
+                    "timeout": 30.0,  # Increase timeout for concurrent access
+                },
+                pool_pre_ping=True,  # Verify connections before using
+            )
+            # Enable WAL mode for better concurrency (SQLite only)
+            self._enable_wal_mode()
+
         self.SessionLocal = sessionmaker(
             autocommit=False, autoflush=False, bind=self.engine
         )
 
-        # Enable WAL mode for better concurrency
-        self._enable_wal_mode()
-
     def _enable_wal_mode(self):
         """Enable WAL (Write-Ahead Logging) mode for better SQLite concurrency."""
+        if self.db_type != "sqlite":
+            return
+
         import sqlite3
 
         try:
@@ -60,16 +98,26 @@ class Database:
         """Create all database tables and ensure all required fields exist."""
         try:
             Base.metadata.create_all(bind=self.engine)
-            logger.info(f"Database tables created successfully in {self.db_path}")
+            if self.db_type == "sqlite":
+                logger.info(f"Database tables created successfully in {self.db_path}")
+            else:
+                logger.info("Database tables created successfully in PostgreSQL")
 
-            # Ensure all required fields exist (for existing databases)
-            self._ensure_all_fields_exist()
+            # Ensure all required fields exist (for existing databases - SQLite only)
+            if self.db_type == "sqlite":
+                self._ensure_all_fields_exist()
+
+            # Ensure spatial indexes exist
+            self._ensure_indexes_exist()
         except SQLAlchemyError as e:
             logger.error(f"Error creating database tables: {e}")
             raise
 
     def _ensure_all_fields_exist(self):
-        """Ensure all required fields exist in the database tables."""
+        """Ensure all required fields exist in the database tables (SQLite only)."""
+        if self.db_type != "sqlite":
+            return
+
         import sqlite3
 
         try:
@@ -106,6 +154,111 @@ class Database:
         except Exception as e:
             logger.warning(
                 f"Could not ensure all fields exist (this is OK for new databases): {e}"
+            )
+
+    def _ensure_indexes_exist(self):
+        """Ensure spatial indexes on addresses and sort indexes on price_history exist."""
+        try:
+            session = self.get_session()
+
+            if self.db_type == "sqlite":
+                import sqlite3
+
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+
+                # Addresses indexes
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='addresses'"
+                )
+                addr_indexes = [row[0] for row in cursor.fetchall()]
+                if "idx_lat_lng" not in addr_indexes:
+                    logger.info(
+                        "Creating spatial index idx_lat_lng on addresses table..."
+                    )
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_lat_lng ON addresses(latitude, longitude)"
+                    )
+                if "idx_county" not in addr_indexes:
+                    logger.info("Creating index idx_county on addresses table...")
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_county ON addresses(county)"
+                    )
+
+                # price_history: composite index for sort-by-price/date (GROUP BY property_id, MAX(date_of_sale))
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='price_history'"
+                )
+                ph_indexes = [row[0] for row in cursor.fetchall()]
+                if "idx_price_history_property_date" not in ph_indexes:
+                    logger.info(
+                        "Creating index idx_price_history_property_date on price_history table..."
+                    )
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_price_history_property_date ON price_history(property_id, date_of_sale)"
+                    )
+
+                conn.commit()
+                conn.close()
+
+            elif self.db_type == "postgresql":
+                # For PostgreSQL, use raw SQL to create indexes if they don't exist
+                from sqlalchemy import text
+
+                # Addresses indexes
+                result = session.execute(
+                    text(
+                        """
+                    SELECT indexname FROM pg_indexes 
+                    WHERE tablename = 'addresses' 
+                    AND indexname IN ('idx_lat_lng', 'idx_county')
+                """
+                    )
+                )
+                addr_indexes = [row[0] for row in result.fetchall()]
+                if "idx_lat_lng" not in addr_indexes:
+                    logger.info(
+                        "Creating spatial index idx_lat_lng on addresses table..."
+                    )
+                    session.execute(
+                        text(
+                            "CREATE INDEX idx_lat_lng ON addresses(latitude, longitude)"
+                        )
+                    )
+                if "idx_county" not in addr_indexes:
+                    logger.info("Creating index idx_county on addresses table...")
+                    session.execute(
+                        text("CREATE INDEX idx_county ON addresses(county)")
+                    )
+
+                # price_history: composite index for sort-by-price/date
+                result = session.execute(
+                    text(
+                        """
+                    SELECT indexname FROM pg_indexes 
+                    WHERE tablename = 'price_history' 
+                    AND indexname = 'idx_price_history_property_date'
+                """
+                    )
+                )
+                if result.fetchone() is None:
+                    logger.info(
+                        "Creating index idx_price_history_property_date on price_history table..."
+                    )
+                    session.execute(
+                        text(
+                            "CREATE INDEX idx_price_history_property_date ON price_history(property_id, date_of_sale)"
+                        )
+                    )
+
+                session.commit()
+
+            session.close()
+            logger.info("Indexes verified/created successfully")
+
+        except Exception as e:
+            logger.warning(
+                f"Could not ensure indexes exist (this is OK for new databases): {e}"
             )
 
     def get_session(self) -> Session:

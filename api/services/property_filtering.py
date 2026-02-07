@@ -108,49 +108,58 @@ def get_latest_prices_in_date_range(
         except ValueError:
             pass
 
-    # Query for latest prices
-    latest_prices_query = db.query(
-        PriceHistoryModel.property_id,
-        func.max(PriceHistoryModel.date_of_sale).label("latest_date"),
-    ).filter(PriceHistoryModel.property_id.in_(property_ids))
-
-    # Apply date filter if provided - get latest price WITHIN the date range
-    if price_date_filter:
-        latest_prices_query = latest_prices_query.filter(and_(*price_date_filter))
-
-    latest_prices_subquery = latest_prices_query.group_by(
-        PriceHistoryModel.property_id
-    ).subquery()
-
-    latest_prices = (
-        db.query(
-            PriceHistoryModel.property_id,
-            PriceHistoryModel.price,
-            PriceHistoryModel.date_of_sale,
-        )
-        .join(
-            latest_prices_subquery,
-            and_(
-                PriceHistoryModel.property_id == latest_prices_subquery.c.property_id,
-                PriceHistoryModel.date_of_sale == latest_prices_subquery.c.latest_date,
-            ),
-        )
-        .all()
-    )
-
-    # Create a dict for fast lookup: property_id -> (price, date)
-    # Convert date to string in YYYY-MM-DD format for API response
+    # Batch queries to avoid SQL parameter limits (typically 1000-2000)
+    # Process in chunks of 1000 to be safe
+    BATCH_SIZE = 10000
     result = {}
-    for pid, price, sale_date in latest_prices:
-        date_str = None
-        if sale_date:
-            if isinstance(sale_date, date_type):
-                date_str = sale_date.strftime("%Y-%m-%d")
-            elif isinstance(sale_date, datetime):
-                date_str = sale_date.date().strftime("%Y-%m-%d")
-            elif isinstance(sale_date, str):
-                date_str = sale_date
-        result[pid] = (price, date_str)
+
+    for i in range(0, len(property_ids), BATCH_SIZE):
+        batch_ids = property_ids[i : i + BATCH_SIZE]
+
+        # Query for latest prices for this batch
+        latest_prices_query = db.query(
+            PriceHistoryModel.property_id,
+            func.max(PriceHistoryModel.date_of_sale).label("latest_date"),
+        ).filter(PriceHistoryModel.property_id.in_(batch_ids))
+
+        # Apply date filter if provided - get latest price WITHIN the date range
+        if price_date_filter:
+            latest_prices_query = latest_prices_query.filter(and_(*price_date_filter))
+
+        latest_prices_subquery = latest_prices_query.group_by(
+            PriceHistoryModel.property_id
+        ).subquery()
+
+        latest_prices = (
+            db.query(
+                PriceHistoryModel.property_id,
+                PriceHistoryModel.price,
+                PriceHistoryModel.date_of_sale,
+            )
+            .join(
+                latest_prices_subquery,
+                and_(
+                    PriceHistoryModel.property_id
+                    == latest_prices_subquery.c.property_id,
+                    PriceHistoryModel.date_of_sale
+                    == latest_prices_subquery.c.latest_date,
+                ),
+            )
+            .all()
+        )
+
+        # Add results to dict
+        for pid, price, sale_date in latest_prices:
+            date_str = None
+            if sale_date:
+                if isinstance(sale_date, date_type):
+                    date_str = sale_date.strftime("%Y-%m-%d")
+                elif isinstance(sale_date, datetime):
+                    date_str = sale_date.date().strftime("%Y-%m-%d")
+                elif isinstance(sale_date, str):
+                    date_str = sale_date
+            result[pid] = (price, date_str)
+
     return result
 
 
@@ -167,6 +176,7 @@ def build_property_query(
     max_price: Optional[float] = None,
     has_geocoding: Optional[bool] = None,
     has_daft_data: Optional[bool] = None,
+    min_sales: Optional[int] = None,
 ) -> Query:
     """
     Build a base query for properties within a viewport with optional filters.
@@ -184,6 +194,7 @@ def build_property_query(
         max_price: Optional maximum price filter
         has_geocoding: Optional geocoding status filter
         has_daft_data: Optional Daft.ie data availability filter
+        min_sales: Optional minimum number of price history entries (e.g. 2 = at least 2 sales)
 
     Returns:
         SQLAlchemy query for PropertyModel and AddressModel
@@ -252,5 +263,17 @@ def build_property_query(
             query = query.filter(price_subquery.c.latest_price >= min_price)
         if max_price is not None:
             query = query.filter(price_subquery.c.latest_price <= max_price)
+
+    # Min sales: properties with at least N price history entries
+    if min_sales is not None and min_sales >= 1:
+        sales_count_subquery = (
+            db.query(PriceHistoryModel.property_id)
+            .group_by(PriceHistoryModel.property_id)
+            .having(func.count(PriceHistoryModel.id) >= min_sales)
+            .subquery()
+        )
+        query = query.join(
+            sales_count_subquery, PropertyModel.id == sales_count_subquery.c.property_id
+        )
 
     return query

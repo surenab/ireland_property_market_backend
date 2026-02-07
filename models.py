@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     JSON,
     Date,
+    Index,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -150,6 +151,10 @@ class AddressModel(Base):
     """SQLAlchemy model for Address."""
 
     __tablename__ = "addresses"
+    __table_args__ = (
+        Index("idx_lat_lng", "latitude", "longitude"),
+        Index("idx_county", "county"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     property_id = Column(
@@ -174,6 +179,10 @@ class PriceHistoryModel(Base):
     """SQLAlchemy model for PriceHistory."""
 
     __tablename__ = "price_history"
+    __table_args__ = (
+        # Speeds up sort-by-price/date: GROUP BY property_id, MAX(date_of_sale) and joins on (property_id, date_of_sale)
+        Index("idx_price_history_property_date", "property_id", "date_of_sale"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     property_id = Column(
