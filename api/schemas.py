@@ -34,7 +34,7 @@ class PriceHistoryResponse(BaseModel):
 
     id: int
     date_of_sale: str  # Serialized as string in YYYY-MM-DD format
-    price: float
+    price: int
     not_full_market_price: bool
     vat_exclusive: bool
     description: str
@@ -48,7 +48,7 @@ class PriceHistoryResponse(BaseModel):
         """Custom from_orm to handle date serialization."""
         data = {
             "id": obj.id,
-            "price": obj.price,
+            "price": int(round(obj.price)) if obj.price is not None else 0,
             "not_full_market_price": obj.not_full_market_price,
             "vat_exclusive": obj.vat_exclusive,
             "description": obj.description,
@@ -100,7 +100,7 @@ class PropertyListItem(BaseModel):
     county: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    latest_price: Optional[float] = None
+    latest_price: Optional[int] = None
     latest_sale_date: Optional[str] = None
 
     class Config:
@@ -118,7 +118,7 @@ class MapPoint(BaseModel):
     id: int
     latitude: float
     longitude: float
-    price: Optional[float] = None
+    price: Optional[int] = None
     address: Optional[str] = None
     county: Optional[str] = None
     date: Optional[str] = None
@@ -320,7 +320,7 @@ class PriceHistoryBulk(BaseModel):
     """Price history for bulk upload."""
 
     date_of_sale: str  # YYYY-MM-DD format
-    price: float
+    price: int
     not_full_market_price: bool = False
     vat_exclusive: bool = False
     description: str
@@ -374,3 +374,32 @@ class BulkUploadResponse(BaseModel):
     updated: int
     failed: int
     results: List[BulkUploadResult]
+
+
+class PprUploadResponse(BaseModel):
+    """PPR CSV upload response schema."""
+
+    total_rows: int
+    unique_properties: int
+    created: int
+    updated: int
+    skipped: int
+    geocoded: int
+    failed_geocode: int
+    daft_scraped: int = 0
+    failed_daft: int = 0
+    errors: List[str] = []
+
+
+class PprImportJobStartResponse(BaseModel):
+    """Response when starting an async PPR import (upload or download-and-import)."""
+
+    job_id: str
+
+
+class PprImportStatusResponse(BaseModel):
+    """Status of an async PPR import job."""
+
+    status: str  # "running" | "completed" | "failed"
+    result: Optional[PprUploadResponse] = None
+    error: Optional[str] = None

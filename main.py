@@ -11,7 +11,7 @@ import logging
 
 from database import Database
 from config import set_db_instance, get_db_instance, is_production, ENVIRONMENT
-from api.routes import properties, map, statistics, address
+from api.routes import address, map, properties, statistics, upload
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
 
@@ -36,6 +36,7 @@ app = FastAPI(
     description="API for accessing Irish property data with geocoding and statistics",
     version="1.0.0",
 )
+
 
 # Log each request method, path, and running time
 class RequestTimingMiddleware(BaseHTTPMiddleware):
@@ -64,6 +65,7 @@ app.include_router(properties.router, prefix="/api/properties", tags=["propertie
 app.include_router(map.router, prefix="/api/maps", tags=["maps"])
 app.include_router(statistics.router, prefix="/api/statistics", tags=["statistics"])
 app.include_router(address.router, prefix="/api/addresses", tags=["addresses"])
+app.include_router(upload.router, prefix="/api/admin", tags=["admin"])
 
 
 @app.get("/")

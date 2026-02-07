@@ -553,7 +553,7 @@ class PriceHistoryRepository:
         self,
         property_id: int,
         date_of_sale: datetime,
-        price: float,
+        price: int,
         not_full_market_price: bool,
         vat_exclusive: bool,
         description: str,

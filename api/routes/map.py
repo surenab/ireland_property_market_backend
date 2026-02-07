@@ -32,6 +32,8 @@ SAMPLE_POINTS_CAP = 500
 MAX_POINTS_ZOOM_10_PLUS = (
     5000  # was 50k; lower cap avoids slow queries and huge responses
 )
+# Heatmap / analysis modes: load up to 20k points for density and heatmap visualizations
+HEATMAP_MAX_POINTS = 140000
 
 
 def get_max_points_for_zoom(zoom: Optional[int]) -> int:
@@ -328,7 +330,9 @@ async def get_map_list(
                 county=address.county if address else None,
                 latitude=address.latitude if address else None,
                 longitude=address.longitude if address else None,
-                latest_price=latest_price,
+                latest_price=(
+                    int(round(latest_price)) if latest_price is not None else None
+                ),
                 latest_sale_date=latest_sale_date,
             )
         )
@@ -397,15 +401,26 @@ async def get_map_analysis(
     count = query.count()
     logger.info(f"Found {count} properties in viewport at zoom {zoom}")
 
-    # Apply zoom-based limit for performance
-    # For zoom 0-7, we'll cluster all properties, but still limit raw results for processing
-    max_results = (
-        get_max_points_for_zoom(zoom) * 2
-        if zoom and zoom <= 7
-        else get_max_points_for_zoom(zoom)
+    # Heatmap-related modes: use higher cap (20k) for better visualization; others use zoom-based limit
+    heatmap_modes = (
+        "spatial-patterns",
+        "hotspots",
+        "cluster-identification",
+        "price-heatmap",
+        "sales-heatmap",
     )
+    if analysis_mode in heatmap_modes:
+        max_results = HEATMAP_MAX_POINTS
+    else:
+        max_results = (
+            get_max_points_for_zoom(zoom) * 2
+            if zoom and zoom <= 7
+            else get_max_points_for_zoom(zoom)
+        )
     if count > max_results:
-        logger.info(f"Limiting results from {count} to {max_results} for zoom {zoom}")
+        logger.info(
+            f"Limiting results from {count} to {max_results} for zoom {zoom} analysis_mode={analysis_mode}"
+        )
         query = query.limit(max_results)
 
     results = query.all()
@@ -503,7 +518,7 @@ async def get_map_analysis(
                 "id": prop.id,
                 "latitude": address.latitude,
                 "longitude": address.longitude,
-                "price": latest_price,
+                "price": int(round(latest_price)) if latest_price is not None else None,
                 "date": date_str,
                 "address": address.address,
                 "county": address.county,
@@ -632,7 +647,7 @@ async def get_map_analysis(
                     "id": p.id,
                     "latitude": p.latitude,
                     "longitude": p.longitude,
-                    "price": p.price,
+                    "price": int(round(p.price)) if p.price is not None else None,
                     "address": p.address,
                     "county": p.county,
                 }
@@ -844,7 +859,7 @@ async def get_map_analysis(
                         "id": p.id,
                         "latitude": p.latitude,
                         "longitude": p.longitude,
-                        "price": p.price,
+                        "price": int(round(p.price)) if p.price is not None else None,
                         "address": p.address,
                         "county": p.county,
                     }

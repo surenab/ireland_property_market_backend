@@ -239,7 +239,7 @@ async def list_properties(
                 county=address.county if address else None,
                 latitude=address.latitude if address else None,
                 longitude=address.longitude if address else None,
-                latest_price=latest_price,
+                latest_price=int(round(latest_price)) if latest_price is not None else None,
                 latest_sale_date=latest_sale_date,
             )
         )

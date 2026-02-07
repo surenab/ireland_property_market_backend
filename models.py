@@ -95,7 +95,7 @@ class PriceHistoryBase(BaseModel):
     """Base price history model."""
 
     date_of_sale: datetime
-    price: float
+    price: int
     not_full_market_price: bool
     vat_exclusive: bool
     description: str
@@ -189,7 +189,7 @@ class PriceHistoryModel(Base):
         Integer, ForeignKey("properties.id"), nullable=False, index=True
     )
     date_of_sale = Column(Date, nullable=False, index=True)
-    price = Column(Float, nullable=False)
+    price = Column(Integer, nullable=False)
     not_full_market_price = Column(Boolean, nullable=False)
     vat_exclusive = Column(Boolean, nullable=False)
     description = Column(Text, nullable=False)
@@ -225,17 +225,19 @@ def generate_address_hash(
     return hashlib.md5(hash_string.encode()).hexdigest()
 
 
-def parse_price(price_str: str) -> float:
-    """Parse price string to float."""
+def parse_price(price_str: str) -> int:
+    """Parse price string to integer (whole euros). Handles €, £, replacement chars, and commas."""
     if not price_str:
-        return 0.0
-
-    # Remove currency symbols, commas, and whitespace
-    cleaned = price_str.replace("€", "").replace("£", "").replace(",", "").strip()
+        return 0
+    # Strip currency symbols (€ £) and any other non-numeric except digits, comma, period, minus
+    cleaned = "".join(c for c in str(price_str) if c in "0123456789,.-")
+    cleaned = cleaned.replace(",", "").strip()
+    if not cleaned:
+        return 0
     try:
-        return float(cleaned)
+        return int(round(float(cleaned)))
     except ValueError:
-        return 0.0
+        return 0
 
 
 def parse_boolean(value: str) -> bool:
