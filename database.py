@@ -559,11 +559,12 @@ class PriceHistoryRepository:
         description: str,
         property_size_description: Optional[str] = None,
     ) -> PriceHistoryModel:
-        """Create a new price history record."""
+        """Create a new price history record. Price is stored as integer (whole euros)."""
+        price_int = int(round(float(price))) if price is not None else 0
         price_history = PriceHistoryModel(
             property_id=property_id,
             date_of_sale=date_of_sale,
-            price=price,
+            price=price_int,
             not_full_market_price=not_full_market_price,
             vat_exclusive=vat_exclusive,
             description=description,

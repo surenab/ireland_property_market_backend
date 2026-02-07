@@ -148,7 +148,7 @@ def get_latest_prices_in_date_range(
             .all()
         )
 
-        # Add results to dict
+        # Add results to dict (coerce price to int for whole euros)
         for pid, price, sale_date in latest_prices:
             date_str = None
             if sale_date:
@@ -158,7 +158,8 @@ def get_latest_prices_in_date_range(
                     date_str = sale_date.date().strftime("%Y-%m-%d")
                 elif isinstance(sale_date, str):
                     date_str = sale_date
-            result[pid] = (price, date_str)
+            price_int = int(round(float(price))) if price is not None else 0
+            result[pid] = (price_int, date_str)
 
     return result
 

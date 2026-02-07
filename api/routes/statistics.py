@@ -110,7 +110,7 @@ async def get_price_trends(
         history_data.append(
             {
                 "date_of_sale": date_str,
-                "price": ph.price,
+                "price": int(round(float(ph.price))) if ph.price is not None else 0,
             }
         )
 

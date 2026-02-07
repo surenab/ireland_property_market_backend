@@ -491,9 +491,10 @@ async def get_map_analysis(
                 .all()
             )
 
-            # Add results to dict
+            # Add results to dict (coerce price to int for whole euros)
             for pid, price, date in latest_prices:
-                price_map[pid] = (price, date)
+                price_int = int(round(float(price))) if price is not None else None
+                price_map[pid] = (price_int, date)
     else:
         price_map = {}
 

@@ -122,7 +122,7 @@ def _process_ppr_content(content: bytes, db: Session) -> PprUploadResponse:
                         .first()
                     )
                     if existing_ph:
-                        existing_ph.price = ph["price"]
+                        existing_ph.price = int(round(float(ph["price"]))) if ph.get("price") is not None else 0
                         existing_ph.not_full_market_price = ph["not_full_market_price"]
                         existing_ph.vat_exclusive = ph["vat_exclusive"]
                         existing_ph.description = ph["description"]
@@ -133,7 +133,7 @@ def _process_ppr_content(content: bytes, db: Session) -> PprUploadResponse:
                         price_history_repo.create_price_history(
                             property_id=property_id,
                             date_of_sale=sale_date,
-                            price=ph["price"],
+                            price=int(round(float(ph["price"]))) if ph.get("price") is not None else 0,
                             not_full_market_price=ph["not_full_market_price"],
                             vat_exclusive=ph["vat_exclusive"],
                             description=ph["description"],
@@ -163,7 +163,7 @@ def _process_ppr_content(content: bytes, db: Session) -> PprUploadResponse:
                     price_history_repo.create_price_history(
                         property_id=property_obj.id,
                         date_of_sale=sale_date,
-                        price=ph["price"],
+                        price=int(round(float(ph["price"]))) if ph.get("price") is not None else 0,
                         not_full_market_price=ph["not_full_market_price"],
                         vat_exclusive=ph["vat_exclusive"],
                         description=ph["description"],

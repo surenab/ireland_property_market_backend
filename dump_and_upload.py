@@ -124,31 +124,45 @@ def serialize_property(
         .all()
     )
 
-    # Build property data
+    # Build property data (coerce types for bulk-upload API: str, int, bool)
+    def _opt_str(v):
+        if v is None:
+            return None
+        s = (v or "").strip()
+        return s if s else None
+
     property_data = {
         "address": {
-            "address": address.address,
-            "county": address.county,
-            "eircode": address.eircode,
-            "latitude": address.latitude,
-            "longitude": address.longitude,
-            "formatted_address": address.formatted_address,
-            "country": address.country,
+            "address": (address.address or "").strip() or "",
+            "county": (address.county or "").strip() or "",
+            "eircode": _opt_str(address.eircode),
+            "latitude": float(address.latitude) if address.latitude is not None else None,
+            "longitude": float(address.longitude) if address.longitude is not None else None,
+            "formatted_address": _opt_str(address.formatted_address),
+            "country": _opt_str(address.country),
         },
-        "price_history": [
-            {
-                "date_of_sale": serialize_date(ph.date_of_sale),
-                "price": ph.price,
-                "not_full_market_price": ph.not_full_market_price,
-                "vat_exclusive": ph.vat_exclusive,
-                "description": ph.description,
-                "property_size_description": ph.property_size_description,
-            }
-            for ph in price_history
-        ],
+        "price_history": [],
     }
+    for ph in price_history:
+        sale_date = ph.date_of_sale
+        date_str = serialize_date(sale_date) if sale_date else None
+        if not date_str or date_str == "None":
+            continue
+        try:
+            price_val = ph.price
+            price_int = int(round(float(price_val))) if price_val is not None else 0
+        except (TypeError, ValueError):
+            price_int = 0
+        property_data["price_history"].append({
+            "date_of_sale": date_str,
+            "price": price_int,
+            "not_full_market_price": bool(ph.not_full_market_price),
+            "vat_exclusive": bool(ph.vat_exclusive),
+            "description": (ph.description or "").strip() or "Unknown",
+            "property_size_description": _opt_str(ph.property_size_description),
+        })
 
-    # Add daft data if available
+    # Add daft data if available (ensure bool for daft_scraped)
     if prop.daft_url:
         property_data["daft_url"] = prop.daft_url
     if prop.daft_html:
@@ -157,8 +171,7 @@ def serialize_property(
         property_data["daft_title"] = prop.daft_title
     if prop.daft_body:
         property_data["daft_body"] = prop.daft_body
-    if prop.daft_scraped:
-        property_data["daft_scraped"] = prop.daft_scraped
+    property_data["daft_scraped"] = bool(prop.daft_scraped)
 
     return property_data
 
@@ -211,6 +224,12 @@ def upload_properties(
                     headers={"Content-Type": "application/json"},
                     timeout=300,  # 5 minute timeout for large batches
                 )
+                if response.status_code == 422:
+                    try:
+                        err = response.json()
+                        print(f"\n  Validation error (422): {err}")
+                    except Exception:
+                        print(f"\n  Validation error (422): {response.text[:500]}")
                 response.raise_for_status()
 
                 result = response.json()

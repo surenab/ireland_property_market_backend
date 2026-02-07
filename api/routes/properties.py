@@ -474,8 +474,8 @@ async def bulk_upload_properties(
                 )
 
                 if existing_history:
-                    # Update existing price history
-                    existing_history.price = price_data.price
+                    # Update existing price history (coerce to int for DB)
+                    existing_history.price = int(round(float(price_data.price))) if price_data.price is not None else 0
                     existing_history.not_full_market_price = (
                         price_data.not_full_market_price
                     )
@@ -485,11 +485,11 @@ async def bulk_upload_properties(
                         price_data.property_size_description
                     )
                 else:
-                    # Create new price history
+                    # Create new price history (coerce to int for DB)
                     price_history_repo.create_price_history(
                         property_id=property_id,
                         date_of_sale=sale_date,
-                        price=price_data.price,
+                        price=int(round(float(price_data.price))) if price_data.price is not None else 0,
                         not_full_market_price=price_data.not_full_market_price,
                         vat_exclusive=price_data.vat_exclusive,
                         description=price_data.description,
